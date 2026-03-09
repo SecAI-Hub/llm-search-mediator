@@ -1,0 +1,62 @@
+# =============================================================================
+# llm-search-mediator Policy Configuration -- Annotated Example
+# =============================================================================
+# Controls search behavior, privacy settings, and differential privacy.
+# Set POLICY_PATH env var to point to this file.
+# If no policy file is configured, search is enabled with default settings.
+# =============================================================================
+
+version: 1
+
+search:
+  # Master switch. Set to true to enable web search.
+  enabled: true
+
+  # Maximum query length after PII stripping (characters).
+  max_query_length: 200
+
+  # Maximum search results returned per query.
+  max_results: 5
+
+  # Maximum context size injected into the LLM (characters).
+  max_context_length: 4000
+
+  # Strip PII from outbound queries before sending to SearXNG.
+  # Detects: email, phone, SSN, credit cards, IP addresses, API keys.
+  strip_pii: true
+
+  # Block queries where more than 50% of tokens are redacted PII.
+  block_high_pii_queries: true
+
+  # Scan inbound search results for prompt injection patterns.
+  # Matching results are silently dropped.
+  detect_injection: true
+
+  # Write a hash-chained audit record for every search attempt.
+  audit: true
+
+  # SearXNG search engines to use (if your SearXNG supports engine selection).
+  allowed_engines:
+    - duckduckgo
+    - wikipedia
+    - stackoverflow
+    - github
+
+  # Differential privacy protections for search queries.
+  differential_privacy:
+    # Enable differential privacy (decoys, uniqueness checks, batch timing).
+    enabled: true
+
+    # Number of decoy searches sent before each real search.
+    # Decoys are random generic queries from a curated list.
+    decoy_count: 2
+
+    # How to handle queries with highly unique/identifying terms:
+    #   "auto-block" -- silently block the query
+    #   "warn" -- return a warning but still execute
+    #   "allow" -- no check
+    uniqueness_mode: "warn"
+
+    # Batch timing window (seconds). Queries within this window are
+    # grouped together to prevent timing correlation.
+    batch_window: 5.0

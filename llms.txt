@@ -1,0 +1,49 @@
+# llm-search-mediator
+
+> Privacy-preserving search bridge for local LLMs.
+
+llm-search-mediator is a Python/Flask HTTP service that sits between an LLM
+and a SearXNG metasearch backend. It sanitizes outbound queries (PII stripping),
+applies differential privacy (decoys, query generalization, batch timing),
+protects against traffic analysis (random jitter, fixed-size padding), filters
+inbound results for prompt injection, and audit-logs every decision.
+
+## What it does
+
+- Accepts `POST /v1/search` with `{"query": "...", "categories": "general"}`
+- Strips PII (email, phone, SSN, credit card, IP, API keys, hex tokens)
+- Blocks queries that are >50% redacted PII
+- Checks for identifying patterns (proper names, addresses, case numbers)
+- Sends decoy searches and cover queries for differential privacy
+- Pads queries to fixed-size buckets (256/512/1024 bytes)
+- Adds random timing jitter
+- Sends to SearXNG (optionally through Tor)
+- Strips HTML, detects prompt injection in results, validates URLs
+- Returns sanitized results + pre-formatted LLM context string
+- Writes tamper-evident hash-chained audit log (JSONL)
+
+## API
+
+- `GET  /health`        -- health check + SearXNG status
+- `POST /v1/search`     -- sanitized search
+- `GET  /v1/search/test` -- SearXNG connectivity test
+
+## Configuration (env vars)
+
+- BIND_ADDR (default 127.0.0.1:8485)
+- SEARXNG_URL (default http://127.0.0.1:8888)
+- POLICY_PATH (optional, YAML policy for search settings)
+- AUDIT_DIR (default /var/lib/llm-search-mediator/logs)
+
+## Use cases
+
+- Local AI assistants with web search, RAG pipelines, privacy-focused
+  AI applications, any system where LLMs need web access without leaking
+  user data
+
+## Tech
+
+- Python 3.10+, Flask, requests, pyyaml
+- ~700 lines of code
+- 28 unit tests (PII stripping, injection detection, result sanitization)
+- Part of SecAI OS (https://github.com/SecAI-Hub/SecAI_OS)

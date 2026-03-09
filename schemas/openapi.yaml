@@ -1,0 +1,143 @@
+openapi: "3.0.3"
+info:
+  title: llm-search-mediator API
+  version: "1.0.0"
+  description: >
+    Privacy-preserving search bridge for local LLMs.
+    Sanitizes outbound queries, applies differential privacy, filters
+    inbound results for prompt injection, and audit-logs every decision.
+  license:
+    name: Apache-2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0
+
+servers:
+  - url: http://127.0.0.1:8485
+    description: Local development
+
+paths:
+  /health:
+    get:
+      summary: Health check
+      operationId: getHealth
+      tags: [monitoring]
+      responses:
+        "200":
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: "ok"
+                  search_enabled:
+                    type: boolean
+                  searxng_reachable:
+                    type: boolean
+
+  /v1/search:
+    post:
+      summary: Perform a sanitized web search
+      operationId: search
+      tags: [search]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SearchRequest"
+      responses:
+        "200":
+          description: Search results
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SearchResponse"
+        "400":
+          description: Invalid request
+        "403":
+          description: Search disabled in policy
+        "422":
+          description: Query blocked (PII or uniqueness)
+        "502":
+          description: SearXNG request failed
+        "504":
+          description: Search timed out
+
+  /v1/search/test:
+    get:
+      summary: SearXNG connectivity test
+      operationId: searchTest
+      tags: [monitoring]
+      responses:
+        "200":
+          description: SearXNG reachable
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: "ok"
+                  searxng_status:
+                    type: integer
+                    example: 200
+        "403":
+          description: Search disabled
+        "502":
+          description: SearXNG unreachable
+
+components:
+  schemas:
+    SearchRequest:
+      type: object
+      required: [query]
+      properties:
+        query:
+          type: string
+          description: Search query (PII will be stripped automatically)
+          maxLength: 200
+          example: "what is retrieval augmented generation"
+        categories:
+          type: string
+          description: SearXNG search categories
+          default: "general"
+
+    SearchResponse:
+      type: object
+      properties:
+        results:
+          type: array
+          items:
+            $ref: "#/components/schemas/SearchResult"
+        context:
+          type: string
+          description: Pre-formatted context string for LLM injection
+        query_used:
+          type: string
+          description: Sanitized query that was sent
+        redactions:
+          type: integer
+          description: Number of PII patterns redacted
+        decoys_sent:
+          type: integer
+          description: Number of decoy searches sent
+        uniqueness_warning:
+          type: string
+          nullable: true
+          description: Warning about identifying terms in query
+
+    SearchResult:
+      type: object
+      properties:
+        title:
+          type: string
+        snippet:
+          type: string
+        url:
+          type: string
+          format: uri
+        source:
+          type: string

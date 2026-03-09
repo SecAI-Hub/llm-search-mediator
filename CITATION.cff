@@ -1,0 +1,21 @@
+cff-version: 1.2.0
+title: llm-search-mediator
+message: "If you use this software, please cite it as below."
+type: software
+authors:
+  - name: "SecAI-Hub Contributors"
+repository-code: "https://github.com/SecAI-Hub/llm-search-mediator"
+license: Apache-2.0
+keywords:
+  - llm-security
+  - privacy
+  - pii-stripping
+  - prompt-injection
+  - differential-privacy
+  - search-proxy
+  - ai-safety
+  - audit-logging
+  - searxng
+  - tor
+date-released: "2026-03-09"
+abstract: "Privacy-preserving search bridge for local LLMs. Strips PII from outbound queries, detects prompt injection in inbound results, applies differential privacy with decoy queries and traffic analysis protection, and maintains a tamper-evident audit log."
