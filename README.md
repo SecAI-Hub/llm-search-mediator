@@ -5,7 +5,7 @@
 
 **Privacy-preserving search bridge for local LLMs.**
 
-llm-search-mediator sits between your AI agent and the web. It sanitizes outbound queries (strips PII), pads queries to fixed sizes, sends decoy/cover searches, applies differential privacy, filters inbound results for prompt injection, and audit-logs every decision with a tamper-evident hash chain.
+llm-search-mediator sits between your AI agent and the web. It sanitizes outbound queries (strips PII), pads queries to fixed sizes, sends decoy/cover searches, applies statistical query privacy protections, filters inbound results for prompt injection, and audit-logs every decision with a tamper-evident hash chain.
 
 ## Why
 
@@ -31,12 +31,12 @@ llm-search-mediator solves both problems by acting as a sanitizing proxy in fron
 | High-PII blocking | Blocks queries that are >50% redacted PII |
 | Prompt injection filtering | Detects 6 injection patterns in inbound results and drops them |
 | HTML sanitization | Strips tags, decodes entities, enforces snippet length limits |
-| Differential privacy | Decoy queries, query generalization, k-anonymity checking |
+| Query privacy protections | Decoy queries, query generalization, k-anonymity checking |
 | Traffic analysis protection | Random timing jitter, fixed-size query padding (256/512/1024 byte buckets) |
 | Batch timing | Groups queries into fixed time windows to prevent timing correlation |
 | Query uniqueness detection | Flags queries with proper names, addresses, case numbers |
 | Hash-chained audit log | Tamper-evident JSONL audit trail with SHA-256 chain |
-| Hot-reloadable policy | YAML-based policy with differential privacy settings |
+| Hot-reloadable policy | YAML-based policy with query privacy settings |
 | URL validation | Rejects non-HTTP(S) URLs in results |
 
 ## Quick start
@@ -184,6 +184,71 @@ For production deployment, see [deploy/](deploy/) for:
 - **Seccomp profile** blocking dangerous syscalls
 
 For maximum privacy, route SearXNG through Tor. See [examples/policy.yaml](examples/policy.yaml) for Tor routing setup notes.
+
+## Privacy note
+
+> **These are practical privacy protections (decoys, generalization, k-anonymity checks) -- not formal differential privacy with epsilon/delta guarantees.** The term "differential privacy" in code-level config keys (e.g., `differential_privacy` in policy YAML) is retained for backward compatibility, but the protections provided are best described as _statistical query privacy_: they make it harder for an observer to link a specific query to a specific user, but they do not satisfy the mathematical definition of differential privacy.
+
+## Privacy: data retention
+
+The hash-chained audit log records metadata about every search attempt. Here is what it stores and what it does **not** store:
+
+### What IS stored
+
+| Field | Description |
+|---|---|
+| `query_hash` | Truncated SHA-256 of the **original** query (first 16 hex chars). Not reversible. |
+| `sanitized_query` | The query **after** PII stripping (all PII replaced with placeholders like `[EMAIL]`). |
+| `redactions_count` | Number of PII patterns that were redacted. |
+| `results_returned` | Count of results returned (integer only). |
+| `blocked` | Whether the query was blocked. |
+| `timestamp` | ISO 8601 UTC timestamp. |
+| `prev_hash` / `entry_hash` | SHA-256 chain hashes for tamper evidence. |
+
+### What is NOT stored
+
+- **Raw user queries** -- only the PII-stripped version is logged.
+- **Search result content** -- only the result count is recorded, never titles, snippets, or URLs.
+- **PII values** -- stripped before logging; only placeholder tokens appear.
+- **IP addresses or user identifiers** -- no client metadata is recorded.
+
+### Retention defaults
+
+- **Deletion policy:** none. The log is append-only for tamper evidence. Operators may implement external rotation or deletion policies as needed.
+- **Log rotation:** the audit file rotates automatically at **50 MB** (configurable via `max_size_mb` in `AuditChain`). Rotated files are made read-only (mode `0444`).
+- **Rotated file naming:** `search-audit.<YYYYMMDD-HHMMSS>.jsonl`.
+
+### Verifying chain integrity
+
+```python
+from search_mediator.audit_chain import AuditChain
+
+result = AuditChain.verify("/var/lib/llm-search-mediator/logs/search-audit.jsonl")
+print(result)
+# {"valid": True, "entries": 42, "broken_at": None, "detail": "chain intact: 42 entries verified"}
+```
+
+If any entry has been modified, deleted, or inserted, the `valid` field will be `False` and `broken_at` will indicate the line number of the first break.
+
+## Configuration profiles
+
+Pre-built configuration profiles are provided in `examples/`:
+
+| Profile | File | Description |
+|---|---|---|
+| **Appliance (strict offline)** | [`examples/appliance-profile.yaml`](examples/appliance-profile.yaml) | Search disabled, all privacy protections maxed, no external network. For air-gapped or appliance deployments. |
+| **Standalone** | [`examples/standalone-profile.yaml`](examples/standalone-profile.yaml) | Standard config with recommended defaults for general use with SearXNG. |
+| **Policy reference** | [`examples/policy.yaml`](examples/policy.yaml) | Fully annotated policy reference with all options explained. |
+
+Usage:
+
+```bash
+# Appliance mode (search disabled, privacy maxed)
+POLICY_PATH=./examples/appliance-profile.yaml python -m search_mediator.app
+
+# Standalone mode (recommended defaults)
+POLICY_PATH=./examples/standalone-profile.yaml python -m search_mediator.app
+```
 
 ## Integration with SecAI OS
 

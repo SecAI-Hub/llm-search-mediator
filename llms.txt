@@ -4,7 +4,7 @@
 
 llm-search-mediator is a Python/Flask HTTP service that sits between an LLM
 and a SearXNG metasearch backend. It sanitizes outbound queries (PII stripping),
-applies differential privacy (decoys, query generalization, batch timing),
+applies query privacy protections (decoys, query generalization, batch timing),
 protects against traffic analysis (random jitter, fixed-size padding), filters
 inbound results for prompt injection, and audit-logs every decision.
 
@@ -14,7 +14,7 @@ inbound results for prompt injection, and audit-logs every decision.
 - Strips PII (email, phone, SSN, credit card, IP, API keys, hex tokens)
 - Blocks queries that are >50% redacted PII
 - Checks for identifying patterns (proper names, addresses, case numbers)
-- Sends decoy searches and cover queries for differential privacy
+- Sends decoy searches and cover queries for query privacy
 - Pads queries to fixed-size buckets (256/512/1024 bytes)
 - Adds random timing jitter
 - Sends to SearXNG (optionally through Tor)

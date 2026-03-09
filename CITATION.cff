@@ -18,4 +18,4 @@ keywords:
   - searxng
   - tor
 date-released: "2026-03-09"
-abstract: "Privacy-preserving search bridge for local LLMs. Strips PII from outbound queries, detects prompt injection in inbound results, applies differential privacy with decoy queries and traffic analysis protection, and maintains a tamper-evident audit log."
+abstract: "Privacy-preserving search bridge for local LLMs. Strips PII from outbound queries, detects prompt injection in inbound results, applies statistical query privacy protections (decoy queries, generalization, k-anonymity checks), and maintains a tamper-evident audit log."

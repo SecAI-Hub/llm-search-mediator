@@ -4,8 +4,9 @@ info:
   version: "1.0.0"
   description: >
     Privacy-preserving search bridge for local LLMs.
-    Sanitizes outbound queries, applies differential privacy, filters
-    inbound results for prompt injection, and audit-logs every decision.
+    Sanitizes outbound queries, applies query privacy protections (decoys,
+    generalization, k-anonymity checks), filters inbound results for prompt
+    injection, and audit-logs every decision.
   license:
     name: Apache-2.0
     url: https://www.apache.org/licenses/LICENSE-2.0

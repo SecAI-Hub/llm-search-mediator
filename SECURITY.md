@@ -8,13 +8,16 @@ If you discover a security vulnerability in llm-search-mediator, please report i
 
 **Do not** open a public GitHub issue for security vulnerabilities.
 
-## Response timeline
+## Disclosure timeline
 
-| Stage | Target |
-|---|---|
-| Acknowledgement | 48 hours |
-| Triage and severity assessment | 7 days |
-| Fix for Critical/High | 90 days |
+| Stage | Target | Notes |
+|---|---|---|
+| Acknowledgement | 48 hours | Confirms receipt and assigns a tracking ID |
+| Triage and severity assessment | 7 days | CVSS score assigned; reporter notified of severity |
+| Fix for Critical/High | 30 days | Patch developed, reviewed, and tested |
+| Fix for Medium/Low | 90 days | Addressed in next scheduled release |
+| Public disclosure | After fix is released | Coordinated with reporter; CVE requested if applicable |
+| Advisory publication | Same day as fix release | GitHub Security Advisory published |
 
 ## Scope
 
@@ -35,4 +38,10 @@ If you discover a security vulnerability in llm-search-mediator, please report i
 
 ## Supported versions
 
-Only the latest release on the `main` branch is supported.
+| Version | Supported | Notes |
+|---|---|---|
+| 0.1.x (latest) | Yes | Current release; receives security fixes |
+| `main` branch | Yes | Development branch; may include unreleased fixes |
+| < 0.1.0 | No | No pre-release versions are supported |
+
+Only the latest release on the `main` branch receives security updates. Users should always run the most recent tagged version.

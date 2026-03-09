@@ -1,0 +1,48 @@
+# =============================================================================
+# llm-search-mediator -- Standalone Profile (Recommended Defaults)
+# =============================================================================
+# Standard configuration for general use with a local SearXNG instance.
+# Provides a good balance of privacy, usability, and performance.
+# =============================================================================
+
+version: 1
+
+search:
+  enabled: true
+
+  max_query_length: 200
+  max_results: 5
+  max_context_length: 4000
+
+  # PII protection enabled by default.
+  strip_pii: true
+  block_high_pii_queries: true
+
+  # Prompt injection detection enabled.
+  detect_injection: true
+
+  # Audit logging enabled.
+  audit: true
+
+  # A broad set of engines for general-purpose search.
+  allowed_engines:
+    - duckduckgo
+    - wikipedia
+    - stackoverflow
+    - github
+
+  # Query privacy protections (decoys, uniqueness checks, batch timing).
+  # Note: these are practical privacy protections, not formal differential
+  # privacy with epsilon/delta guarantees.
+  differential_privacy:
+    enabled: true
+
+    # 2 decoy queries per real search -- reasonable noise without excessive
+    # latency.
+    decoy_count: 2
+
+    # Warn on identifying queries but still execute them.
+    uniqueness_mode: "warn"
+
+    # 5-second batch window -- groups queries to prevent timing correlation.
+    batch_window: 5.0
