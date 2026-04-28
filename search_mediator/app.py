@@ -10,6 +10,7 @@ inference and online information.
 """
 
 import hashlib
+import hmac
 import html
 import logging
 import os
@@ -32,10 +33,12 @@ BIND_ADDR = os.getenv("BIND_ADDR", "127.0.0.1:8485")
 SEARXNG_URL = os.getenv("SEARXNG_URL", "http://127.0.0.1:8888")
 POLICY_PATH = os.getenv("POLICY_PATH", "")
 AUDIT_DIR = os.getenv("AUDIT_DIR", "/var/lib/llm-search-mediator/logs")
+SERVICE_TOKEN_PATH = os.getenv("SERVICE_TOKEN_PATH", "")
 
 _audit_chain = AuditChain(os.path.join(AUDIT_DIR, "search-audit.jsonl"))
 
 # Limits
+MAX_SEARCH_BODY_BYTES = 16 * 1024
 MAX_QUERY_LENGTH = 200
 MAX_RESULTS = 5
 MAX_SNIPPET_LENGTH = 500
@@ -325,6 +328,10 @@ PII_PATTERNS = [
     (re.compile(r"\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b"), "[PHONE]"),
     (re.compile(r"\b\d{3}-\d{2}-\d{4}\b"), "[SSN]"),
     (re.compile(r"\b(?:\d{4}[-\s]?){3}\d{4}\b"), "[CARD]"),
+    (re.compile(r"\b(?:account|acct)[\s:#-]*\d{6,17}\b", re.I), "[BANK_ACCOUNT]"),
+    (re.compile(r"\b(?:routing|aba)[\s:#-]*\d{9}\b", re.I), "[ROUTING]"),
+    (re.compile(r"\b(?:passport)[\s:#-]*[A-Z0-9]{6,12}\b", re.I), "[PASSPORT]"),
+    (re.compile(r"\b\d{1,6}\s+[A-Za-z0-9.'-]+(?:\s+[A-Za-z0-9.'-]+)*\s+(?:St|Street|Ave|Avenue|Rd|Road|Blvd|Drive|Dr|Lane|Ln|Court|Ct)\b", re.I), "[ADDRESS]"),
     (re.compile(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b"), "[IP]"),
     (re.compile(r"\b(?:born|dob|birthday)[:\s]+\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}\b", re.I), "[DOB]"),
     (re.compile(r"\b(?:sk-|pk-|api[_-]?key[:\s=]+)[a-zA-Z0-9]{20,}\b", re.I), "[API_KEY]"),
@@ -344,6 +351,41 @@ INJECTION_PATTERNS = [
 # HTML tag stripper
 HTML_TAG_RE = re.compile(r"<[^>]+>")
 MULTI_SPACE_RE = re.compile(r"\s+")
+HIGH_RISK_PLACEHOLDERS = {
+    "[SSN]",
+    "[CARD]",
+    "[BANK_ACCOUNT]",
+    "[ROUTING]",
+    "[PASSPORT]",
+    "[API_KEY]",
+    "[HEX_TOKEN]",
+}
+
+
+def _read_service_token() -> str:
+    token = os.getenv("SERVICE_TOKEN", "")
+    if token:
+        return token.strip()
+    if SERVICE_TOKEN_PATH:
+        try:
+            with open(SERVICE_TOKEN_PATH, encoding="utf-8") as f:
+                return f.read().strip()
+        except OSError:
+            return ""
+    return ""
+
+
+def _require_service_token():
+    token = _read_service_token()
+    if not token:
+        return None
+    auth = request.headers.get("Authorization", "")
+    prefix = "Bearer "
+    if not auth.startswith(prefix):
+        return jsonify({"error": "missing bearer token"}), 401
+    if not hmac.compare_digest(auth[len(prefix):], token):
+        return jsonify({"error": "invalid bearer token"}), 403
+    return None
 
 
 def load_policy() -> dict:
@@ -392,6 +434,15 @@ def sanitize_query(raw_query: str) -> dict:
         if matches:
             redactions.extend(matches)
             query = pattern.sub(replacement, query)
+
+    high_risk_count = sum(query.count(placeholder) for placeholder in HIGH_RISK_PLACEHOLDERS)
+    if high_risk_count >= 2:
+        return {
+            "query": query,
+            "redactions": redactions,
+            "blocked": True,
+            "reason": "query contains multiple high-risk identifiers",
+        }
 
     # If the query is mostly redacted, block it
     tokens = query.split()
@@ -488,13 +539,12 @@ def build_context(results: list) -> str:
 # Audit logging
 # ---------------------------------------------------------------------------
 
-def audit_search(query: str, sanitized_query: str, redactions: list,
-                 num_results: int, blocked: bool):
+def audit_search(query: str, redactions: list, num_results: int, blocked: bool):
     """Write a hash-chained audit record for every search attempt."""
     query_hash = hashlib.sha256(query.encode()).hexdigest()[:16]
     _audit_chain.append("web_search", {
         "query_hash": query_hash,
-        "sanitized_query": sanitized_query,
+        "query_length": len(query),
         "redactions_count": len(redactions),
         "results_returned": num_results,
         "blocked": blocked,
@@ -527,10 +577,17 @@ def health():
 def search():
     """Perform a sanitized web search."""
 
+    auth_error = _require_service_token()
+    if auth_error:
+        return auth_error
+
+    if request.content_length and request.content_length > MAX_SEARCH_BODY_BYTES:
+        return jsonify({"error": "request body too large"}), 413
+
     if not _is_search_enabled():
         return jsonify({"error": "web search is disabled in policy"}), 403
 
-    body = request.get_json()
+    body = request.get_json(silent=True)
     if not body:
         return jsonify({"error": "JSON body required"}), 400
 
@@ -540,7 +597,7 @@ def search():
     # Sanitize the outbound query
     san = sanitize_query(raw_query)
     if san["blocked"]:
-        audit_search(raw_query, san["query"], san["redactions"], 0, True)
+        audit_search(raw_query, san["redactions"], 0, True)
         return jsonify({
             "error": f"query blocked: {san['reason']}",
             "redactions": len(san["redactions"]),
@@ -556,7 +613,7 @@ def search():
         if uq["unique"]:
             mode = dp_config["uniqueness_mode"]
             if mode == "auto-block":
-                audit_search(raw_query, san["query"], san["redactions"], 0, True)
+                audit_search(raw_query, san["redactions"], 0, True)
                 return jsonify({
                     "error": "query blocked: contains highly unique/identifying terms",
                     "unique_matches": uq["matches"],
@@ -598,18 +655,18 @@ def search():
         resp.raise_for_status()
         data = resp.json()
     except requests.Timeout:
-        audit_search(raw_query, san["query"], san["redactions"], 0, False)
+        audit_search(raw_query, san["redactions"], 0, False)
         return jsonify({"error": "search timed out"}), 504
     except Exception as e:
         log.exception("SearXNG request failed")
-        audit_search(raw_query, san["query"], san["redactions"], 0, False)
+        audit_search(raw_query, san["redactions"], 0, False)
         return jsonify({"error": f"search failed: {str(e)}"}), 502
 
     raw_results = data.get("results", [])
     clean_results = sanitize_results(raw_results)
     context = build_context(clean_results)
 
-    audit_search(raw_query, san["query"], san["redactions"], len(clean_results), False)
+    audit_search(raw_query, san["redactions"], len(clean_results), False)
 
     log.info("search completed: query_len=%d results=%d redactions=%d delay=%.2fs decoys=%d",
              len(san["query"]), len(clean_results), len(san["redactions"]), delay, decoys_sent)
@@ -630,6 +687,10 @@ def search():
 @app.route("/v1/search/test", methods=["GET"])
 def search_test():
     """Quick connectivity test: verify SearXNG is reachable."""
+    auth_error = _require_service_token()
+    if auth_error:
+        return auth_error
+
     if not _is_search_enabled():
         return jsonify({"error": "web search is disabled"}), 403
 

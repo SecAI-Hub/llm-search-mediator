@@ -3,12 +3,12 @@
 import sys
 from pathlib import Path
 
-import pytest
-
 # Add package to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import search_mediator.app as app_module
 from search_mediator.app import (
+    audit_search,
     build_context,
     check_injection,
     sanitize_query,
@@ -58,6 +58,11 @@ class TestQuerySanitization:
     def test_api_key_stripped(self):
         result = sanitize_query("use api_key: sk-abc123def456ghi789jkl012mno345pqr")
         assert "[API_KEY]" in result["query"]
+
+    def test_multiple_high_risk_identifiers_blocked(self):
+        result = sanitize_query("SSN 123-45-6789 routing 123456789")
+        assert result["blocked"]
+        assert "high-risk" in result["reason"]
 
     def test_mostly_pii_blocked(self):
         result = sanitize_query("john@example.com 555-123-4567 123-45-6789")
@@ -184,3 +189,34 @@ class TestContextBuilding:
         ]
         ctx = build_context(results)
         assert len(ctx) <= 4100  # MAX_CONTEXT_LENGTH + truncation notice
+
+
+# ---------------------------------------------------------------------------
+# Audit and route hardening
+# ---------------------------------------------------------------------------
+
+def test_audit_search_does_not_store_query_text(monkeypatch):
+    records = []
+
+    class FakeAuditChain:
+        def append(self, event, payload):
+            records.append((event, payload))
+
+    monkeypatch.setattr(app_module, "_audit_chain", FakeAuditChain())
+
+    audit_search("sensitive medical query", ["medical"], 2, False)
+
+    event, payload = records[0]
+    assert event == "web_search"
+    assert "sanitized_query" not in payload
+    assert "sensitive medical query" not in str(payload)
+    assert payload["query_length"] == len("sensitive medical query")
+
+
+def test_search_requires_service_token_when_configured(monkeypatch):
+    monkeypatch.setenv("SERVICE_TOKEN", "test-token")
+    client = app_module.app.test_client()
+
+    response = client.post("/v1/search", json={"query": "hello"})
+
+    assert response.status_code == 401
