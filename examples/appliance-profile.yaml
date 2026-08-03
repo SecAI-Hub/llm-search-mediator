@@ -4,7 +4,6 @@
 # For air-gapped, appliance, or maximum-privacy deployments.
 #
 # Search is DISABLED. No external network traffic is generated.
-# All privacy protections are set to their strictest values.
 # Use this profile when the LLM must operate entirely offline.
 # =============================================================================
 
@@ -14,23 +13,10 @@ search:
   # Search is disabled -- no queries leave the host.
   enabled: false
 
-  # These settings have no effect when search is disabled, but are set to
-  # their strictest values so that if search is accidentally enabled, the
-  # most protective defaults apply.
-
-  max_query_length: 100
-  max_results: 3
-  max_context_length: 2000
-
-  strip_pii: true
-  block_high_pii_queries: true
-  detect_injection: true
-  audit: true
-
-  # Restrict to privacy-respecting engines only.
-  allowed_engines:
-    - duckduckgo
-    - wikipedia
+  # Engines are configured in SearXNG. This list controls only request
+  # categories and remains fail-closed if malformed.
+  allowed_categories:
+    - general
 
   # Query privacy protections (decoys, uniqueness checks, batch timing).
   # Note: these are practical privacy protections, not formal differential

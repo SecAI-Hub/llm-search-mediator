@@ -1,0 +1,9 @@
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Known synthetic API-key value used by the redaction test"
+regexTarget = "match"
+regexes = [
+  '''api_key: sk-abc123def456ghi789jkl012mno345pqr''',
+]

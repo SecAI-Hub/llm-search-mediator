@@ -4,12 +4,17 @@ After=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 -m search_mediator.app
+ExecStart=/opt/llm-search-mediator/.venv/bin/gunicorn --config python:search_mediator.gunicorn_conf search_mediator.app:app
 WorkingDirectory=/opt/llm-search-mediator
 Environment=BIND_ADDR=127.0.0.1:8485
 Environment=SEARXNG_URL=http://127.0.0.1:8888
 Environment=POLICY_PATH=/etc/llm-search-mediator/policy.yaml
 Environment=AUDIT_DIR=/var/lib/llm-search-mediator/logs
+Environment=SERVICE_TOKEN_PATH=/run/credentials/llm-search-mediator.service/service-token
+Environment=AUDIT_HMAC_KEY_PATH=/run/credentials/llm-search-mediator.service/audit-hmac-key
+LoadCredential=service-token:/etc/llm-search-mediator/service-token
+LoadCredential=audit-hmac-key:/etc/llm-search-mediator/audit-hmac-key
+UMask=0077
 
 # Filesystem isolation
 DynamicUser=yes
@@ -62,6 +67,8 @@ LimitCORE=0
 
 Restart=always
 RestartSec=2
+TimeoutStartSec=30
+TimeoutStopSec=30
 
 [Install]
 WantedBy=multi-user.target

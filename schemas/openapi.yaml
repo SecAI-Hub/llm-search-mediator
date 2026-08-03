@@ -16,11 +16,32 @@ servers:
     description: Local development
 
 paths:
+  /live:
+    get:
+      summary: Process liveness check
+      operationId: getLiveness
+      tags: [monitoring]
+      security: []
+      responses:
+        "200":
+          description: Process is running; no upstream or policy assertion
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    enum: [ok]
+
   /health:
     get:
-      summary: Health check
+      summary: Authenticated readiness check
       operationId: getHealth
       tags: [monitoring]
+      security:
+        - bearerAuth: []
       responses:
         "200":
           description: Service is healthy
@@ -36,12 +57,18 @@ paths:
                     type: boolean
                   searxng_reachable:
                     type: boolean
+        "403":
+          description: Missing or invalid bearer token
+        "503":
+          description: Service authentication or policy unavailable
 
   /v1/search:
     post:
       summary: Perform a sanitized web search
       operationId: search
       tags: [search]
+      security:
+        - bearerAuth: []
       requestBody:
         required: true
         content:
@@ -58,19 +85,25 @@ paths:
         "400":
           description: Invalid request
         "403":
-          description: Search disabled in policy
+          description: Invalid bearer token or search disabled in policy
+        "413":
+          description: Request body too large
         "422":
           description: Query blocked (PII or uniqueness)
         "502":
           description: SearXNG request failed
         "504":
           description: Search timed out
+        "503":
+          description: Service authentication or policy unavailable
 
   /v1/search/test:
     get:
       summary: SearXNG connectivity test
       operationId: searchTest
       tags: [monitoring]
+      security:
+        - bearerAuth: []
       responses:
         "200":
           description: SearXNG reachable
@@ -86,11 +119,19 @@ paths:
                     type: integer
                     example: 200
         "403":
-          description: Search disabled
+          description: Invalid bearer token or search disabled
+        "503":
+          description: Service authentication or policy unavailable
         "502":
           description: SearXNG unreachable
 
 components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque service token
+
   schemas:
     SearchRequest:
       type: object
@@ -98,7 +139,9 @@ components:
       properties:
         query:
           type: string
-          description: Search query (PII will be stripped automatically)
+          description: >
+            Search query. The full request-bounded value is inspected for PII;
+            sanitized values over 200 characters are rejected, not truncated.
           maxLength: 200
           example: "what is retrieval augmented generation"
         categories:
@@ -115,7 +158,7 @@ components:
             $ref: "#/components/schemas/SearchResult"
         context:
           type: string
-          description: Pre-formatted context string for LLM injection
+          description: Bounded, untrusted search-result context for an LLM
         query_used:
           type: string
           description: Sanitized query that was sent

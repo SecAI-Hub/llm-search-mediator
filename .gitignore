@@ -29,3 +29,22 @@ htmlcov/
 
 # Audit logs (generated at runtime)
 *.jsonl
+*.jsonl.checkpoint
+*.key
+.local-audit/
+service-token
+audit-hmac-key
+
+# Local secrets and runtime state
+.env
+.env.*
+!.env.example
+*.token
+*.pem
+*.p12
+*.pfx
+secrets/
+credentials/
+*.db
+*.sqlite
+*.sqlite3

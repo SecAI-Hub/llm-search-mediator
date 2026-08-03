@@ -10,26 +10,10 @@ version: 1
 search:
   enabled: true
 
-  max_query_length: 200
-  max_results: 5
-  max_context_length: 4000
-
-  # PII protection enabled by default.
-  strip_pii: true
-  block_high_pii_queries: true
-
-  # Prompt injection detection enabled.
-  detect_injection: true
-
-  # Audit logging enabled.
-  audit: true
-
-  # A broad set of engines for general-purpose search.
-  allowed_engines:
-    - duckduckgo
-    - wikipedia
-    - stackoverflow
-    - github
+  # Engines are configured in SearXNG; callers may request only these
+  # mediator categories.
+  allowed_categories:
+    - general
 
   # Query privacy protections (decoys, uniqueness checks, batch timing).
   # Note: these are practical privacy protections, not formal differential

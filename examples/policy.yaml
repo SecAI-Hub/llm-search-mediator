@@ -1,9 +1,10 @@
 # =============================================================================
 # llm-search-mediator Policy Configuration -- Annotated Example
 # =============================================================================
-# Controls search behavior, privacy settings, and differential privacy.
+# Controls search enablement, allowed categories, and statistical query privacy.
 # Set POLICY_PATH env var to point to this file.
-# If no policy file is configured, search is enabled with default settings.
+# Missing or malformed policy disables search. No-policy operation requires the
+# explicit loopback-only SECAI_ALLOW_INSECURE_NO_AUTH=1 development override.
 # =============================================================================
 
 version: 1
@@ -12,39 +13,15 @@ search:
   # Master switch. Set to true to enable web search.
   enabled: true
 
-  # Maximum query length after PII stripping (characters).
-  max_query_length: 200
+  # Request categories accepted from callers. Configure the underlying engines
+  # in SearXNG itself. Invalid category configuration fails closed.
+  allowed_categories:
+    - general
 
-  # Maximum search results returned per query.
-  max_results: 5
-
-  # Maximum context size injected into the LLM (characters).
-  max_context_length: 4000
-
-  # Strip PII from outbound queries before sending to SearXNG.
-  # Detects: email, phone, SSN, credit cards, IP addresses, API keys.
-  strip_pii: true
-
-  # Block queries where more than 50% of tokens are redacted PII.
-  block_high_pii_queries: true
-
-  # Scan inbound search results for prompt injection patterns.
-  # Matching results are silently dropped.
-  detect_injection: true
-
-  # Write a hash-chained audit record for every search attempt.
-  audit: true
-
-  # SearXNG search engines to use (if your SearXNG supports engine selection).
-  allowed_engines:
-    - duckduckgo
-    - wikipedia
-    - stackoverflow
-    - github
-
-  # Differential privacy protections for search queries.
+  # Statistical query privacy protections. These are not formal differential
+  # privacy and provide no epsilon/delta guarantee.
   differential_privacy:
-    # Enable differential privacy (decoys, uniqueness checks, batch timing).
+    # Enable decoys, uniqueness checks, generalization, and batch timing.
     enabled: true
 
     # Number of decoy searches sent before each real search.

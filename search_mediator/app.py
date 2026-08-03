@@ -9,25 +9,36 @@ The LLM never touches the network. This service is the only bridge between
 inference and online information.
 """
 
-import hashlib
 import hmac
 import html
+import ipaddress
+import json
 import logging
+import math
 import os
-import random
 import re
+import secrets
+import stat
+import threading
 import time
-from urllib.parse import urlparse
+import unicodedata
+from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 import requests
 import yaml
-from flask import Flask, jsonify, request
+from flask import Flask, Response, jsonify, request
+from werkzeug.exceptions import RequestEntityTooLarge
 
 from .audit_chain import AuditChain
 
 log = logging.getLogger("search-mediator")
 
 app = Flask(__name__)
+_privacy_random = secrets.SystemRandom()
+_upstream_session = requests.Session()
+# Do not let ambient HTTP(S)_PROXY variables redirect sensitive queries.
+_upstream_session.trust_env = False
 
 BIND_ADDR = os.getenv("BIND_ADDR", "127.0.0.1:8485")
 SEARXNG_URL = os.getenv("SEARXNG_URL", "http://127.0.0.1:8888")
@@ -43,10 +54,45 @@ MAX_QUERY_LENGTH = 200
 MAX_RESULTS = 5
 MAX_SNIPPET_LENGTH = 500
 MAX_CONTEXT_LENGTH = 4000
+MAX_POLICY_BYTES = 1024 * 1024
+MAX_UPSTREAM_BODY_BYTES = 2 * 1024 * 1024
+MAX_RESULT_URL_LENGTH = 2048
+DEFAULT_SEARCH_CATEGORIES = {"general"}
+app.config["MAX_CONTENT_LENGTH"] = MAX_SEARCH_BODY_BYTES
+
+
+class PolicyError(RuntimeError):
+    """Raised when the search policy cannot be loaded or validated."""
+
+
+_DEVELOPMENT_POLICY = {
+    "version": 1,
+    "search": {
+        "enabled": True,
+        "allowed_categories": ["general"],
+        "differential_privacy": {
+            "enabled": False,
+            "decoy_count": 0,
+            "uniqueness_mode": "auto-block",
+            "batch_window": 0.0,
+        },
+    },
+}
 
 # Traffic analysis protection
-QUERY_DELAY_MIN = float(os.getenv("QUERY_DELAY_MIN", "0.5"))   # seconds
-QUERY_DELAY_MAX = float(os.getenv("QUERY_DELAY_MAX", "3.0"))   # seconds
+def _bounded_delay_env(name: str, default: float) -> float:
+    """Read a finite delay in the supported 0-30 second range."""
+    try:
+        value = float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(value):
+        return default
+    return max(0.0, min(value, 30.0))
+
+
+QUERY_DELAY_MIN = _bounded_delay_env("QUERY_DELAY_MIN", 0.5)
+QUERY_DELAY_MAX = _bounded_delay_env("QUERY_DELAY_MAX", 3.0)
 QUERY_PAD_BUCKETS = [256, 512, 1024]  # fixed-size query padding buckets (bytes)
 
 # Differential privacy for search queries
@@ -138,8 +184,8 @@ RARE_QUERY_PATTERNS = [
     re.compile(r"\b[A-Z][a-z]+\s+[A-Z][a-z]+\b"),       # Proper names (First Last)
     re.compile(r"\b\d+\s+[A-Z][a-z]+\s+(?:St|Ave|Rd|Blvd|Dr|Ln|Ct)\b"),  # Street addresses
     re.compile(r"\b[A-Z]{2,}\s*-?\s*\d{3,}\b"),           # Case/ID numbers
-    re.compile(r"\brare\s+disease\b", re.I),               # Rare medical terms
-    re.compile(r"\bcase\s+(?:no|number|#)\s*\d+\b", re.I), # Case references
+    re.compile(r"\brare\s+disease\b", re.IGNORECASE),               # Rare medical terms
+    re.compile(r"\bcase\s+(?:no|number|#)\s*\d+\b", re.IGNORECASE), # Case references
 ]
 
 # Query generalization: keyword -> broader category term for cover traffic.
@@ -174,16 +220,98 @@ CATEGORY_KEYWORDS = {
 }
 
 # Batch timing state
-_batch_lock = None  # initialized lazily
+_batch_lock = threading.Lock()
 _last_batch_time = 0.0
 
 # ---------------------------------------------------------------------------
 # Traffic analysis protection
 # ---------------------------------------------------------------------------
 
+def _validated_searxng_base_url() -> str:
+    """Return a canonical operator-configured HTTP(S) SearXNG base URL."""
+    raw_url = SEARXNG_URL.strip()
+    if raw_url != SEARXNG_URL or len(raw_url.encode("utf-8")) > 2048:
+        raise ValueError("SEARXNG_URL is padded or too long")
+    if any(ord(character) < 0x20 or ord(character) == 0x7F for character in raw_url):
+        raise ValueError("SEARXNG_URL contains control characters")
+    parsed = urlparse(raw_url)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or parsed.path not in {"", "/"}
+    ):
+        raise ValueError(
+            "SEARXNG_URL must be an HTTP(S) origin without credentials or URL data"
+        )
+    try:
+        _ = parsed.port
+    except ValueError as exc:
+        raise ValueError("SEARXNG_URL contains an invalid port") from exc
+    return raw_url.rstrip("/")
+
+
+def _fixed_upstream_headers() -> dict[str, str]:
+    """Return stable headers that do not forward caller or host identity."""
+    return {
+        "Accept": "application/json",
+        "Accept-Encoding": "gzip, deflate",
+        "Accept-Language": "en-US,en;q=0.9",
+        "User-Agent": "SecAI-SearchMediator/1.0",
+        "X-Forwarded-For": "127.0.0.1",
+        "X-Real-IP": "127.0.0.1",
+    }
+
+
+def _upstream_get(
+    endpoint: str,
+    *,
+    params: dict | None = None,
+    timeout: float,
+    expect_json: bool,
+):
+    """Call SearXNG without redirects, proxies, or unbounded response reads.
+
+    JSON requests return a decoded object. Status-only requests return the HTTP
+    status code and never consume a response body.
+    """
+    response = _upstream_session.get(
+        f"{_validated_searxng_base_url()}{endpoint}",
+        params=params,
+        headers=_fixed_upstream_headers(),
+        timeout=timeout,
+        allow_redirects=False,
+        stream=True,
+    )
+    if 300 <= response.status_code < 400:
+        response.close()
+        raise requests.RequestException("SearXNG redirects are not permitted")
+    if not expect_json:
+        status_code = response.status_code
+        response.close()
+        return status_code
+
+    try:
+        response.raise_for_status()
+        raw = response.raw.read(MAX_UPSTREAM_BODY_BYTES + 1, decode_content=True)
+        if len(raw) > MAX_UPSTREAM_BODY_BYTES:
+            raise ValueError("SearXNG response exceeded the configured size limit")
+        decoded = json.loads(raw.decode("utf-8", errors="strict"))
+        if not isinstance(decoded, dict):
+            raise TypeError("SearXNG response root must be an object")
+        return decoded
+    finally:
+        response.close()
+
+
 def _random_delay() -> float:
     """Sleep a random duration to decorrelate query timing."""
-    delay = random.uniform(QUERY_DELAY_MIN, QUERY_DELAY_MAX)
+    minimum = max(0.0, min(QUERY_DELAY_MIN, 30.0))
+    maximum = max(minimum, min(QUERY_DELAY_MAX, 30.0))
+    delay = _privacy_random.uniform(minimum, maximum)
     time.sleep(delay)
     return delay
 
@@ -215,17 +343,10 @@ def pad_query(query: str) -> str:
 # Differential privacy for search queries
 # ---------------------------------------------------------------------------
 
-def _load_dp_config() -> dict:
-    """Load differential privacy settings from policy YAML."""
-    policy = load_policy()
-    search = policy.get("search", {})
-    dp = search.get("differential_privacy", {})
-    return {
-        "enabled": dp.get("enabled", True),
-        "decoy_count": dp.get("decoy_count", 2),
-        "uniqueness_mode": dp.get("uniqueness_mode", "warn"),
-        "batch_window": dp.get("batch_window", 5.0),
-    }
+def _load_dp_config(policy: dict | None = None) -> dict:
+    """Return already-validated privacy settings from one policy snapshot."""
+    validated = load_policy() if policy is None else policy
+    return dict(validated["search"]["differential_privacy"])
 
 
 def check_query_uniqueness(query: str) -> dict:
@@ -245,16 +366,18 @@ def check_query_uniqueness(query: str) -> dict:
 
 def generate_decoy_queries(count: int) -> list:
     """Select random decoy queries from the curated list."""
-    count = min(count, len(DECOY_QUERIES))
-    return random.sample(DECOY_QUERIES, count)
+    if isinstance(count, bool) or not isinstance(count, int):
+        return []
+    count = max(0, min(count, len(DECOY_QUERIES)))
+    return _privacy_random.sample(DECOY_QUERIES, count)
 
 
 def send_decoy_search(query: str) -> None:
     """Fire-and-forget a decoy search to SearXNG. Results are discarded."""
     try:
         padded = pad_query(query)
-        requests.get(
-            f"{SEARXNG_URL}/search",
+        _upstream_get(
+            "/search",
             params={
                 "q": padded,
                 "format": "json",
@@ -263,17 +386,18 @@ def send_decoy_search(query: str) -> None:
                 "safesearch": "1",
             },
             timeout=15,
+            expect_json=False,
         )
         log.debug("decoy search sent: %d chars", len(query))
-    except Exception:
-        pass  # decoys are best-effort
+    except (requests.RequestException, OSError, UnicodeError, ValueError, TypeError):
+        log.debug("decoy search failed", exc_info=True)
 
 
 def run_decoy_searches(count: int) -> int:
     """Send decoy searches with random timing. Returns count sent."""
     decoys = generate_decoy_queries(count)
     for dq in decoys:
-        delay = random.uniform(0.2, 1.5)
+        delay = _privacy_random.uniform(0.2, 1.5)
         time.sleep(delay)
         send_decoy_search(dq)
     return len(decoys)
@@ -300,11 +424,6 @@ def apply_batch_delay(batch_window: float) -> float:
     Returns the actual delay applied (0 if no wait was needed).
     """
     global _last_batch_time
-    import threading
-
-    global _batch_lock
-    if _batch_lock is None:
-        _batch_lock = threading.Lock()
 
     with _batch_lock:
         now = time.time()
@@ -328,24 +447,24 @@ PII_PATTERNS = [
     (re.compile(r"\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b"), "[PHONE]"),
     (re.compile(r"\b\d{3}-\d{2}-\d{4}\b"), "[SSN]"),
     (re.compile(r"\b(?:\d{4}[-\s]?){3}\d{4}\b"), "[CARD]"),
-    (re.compile(r"\b(?:account|acct)[\s:#-]*\d{6,17}\b", re.I), "[BANK_ACCOUNT]"),
-    (re.compile(r"\b(?:routing|aba)[\s:#-]*\d{9}\b", re.I), "[ROUTING]"),
-    (re.compile(r"\b(?:passport)[\s:#-]*[A-Z0-9]{6,12}\b", re.I), "[PASSPORT]"),
-    (re.compile(r"\b\d{1,6}\s+[A-Za-z0-9.'-]+(?:\s+[A-Za-z0-9.'-]+)*\s+(?:St|Street|Ave|Avenue|Rd|Road|Blvd|Drive|Dr|Lane|Ln|Court|Ct)\b", re.I), "[ADDRESS]"),
+    (re.compile(r"\b(?:account|acct)[\s:#-]*\d{6,17}\b", re.IGNORECASE), "[BANK_ACCOUNT]"),
+    (re.compile(r"\b(?:routing|aba)[\s:#-]*\d{9}\b", re.IGNORECASE), "[ROUTING]"),
+    (re.compile(r"\b(?:passport)[\s:#-]*[A-Z0-9]{6,12}\b", re.IGNORECASE), "[PASSPORT]"),
+    (re.compile(r"\b\d{1,6}\s+[A-Za-z0-9.'-]+(?:\s+[A-Za-z0-9.'-]+)*\s+(?:St|Street|Ave|Avenue|Rd|Road|Blvd|Drive|Dr|Lane|Ln|Court|Ct)\b", re.IGNORECASE), "[ADDRESS]"),
     (re.compile(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b"), "[IP]"),
-    (re.compile(r"\b(?:born|dob|birthday)[:\s]+\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}\b", re.I), "[DOB]"),
-    (re.compile(r"\b(?:sk-|pk-|api[_-]?key[:\s=]+)[a-zA-Z0-9]{20,}\b", re.I), "[API_KEY]"),
+    (re.compile(r"\b(?:born|dob|birthday)[:\s]+\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}\b", re.IGNORECASE), "[DOB]"),
+    (re.compile(r"\b(?:sk-|pk-|api[_-]?key[:\s=]+)[a-zA-Z0-9]{20,}\b", re.IGNORECASE), "[API_KEY]"),
     (re.compile(r"\b[a-fA-F0-9]{32,}\b"), "[HEX_TOKEN]"),
 ]
 
 # Patterns that suggest prompt injection in search results
 INJECTION_PATTERNS = [
-    re.compile(r"ignore\s+(?:all\s+)?(?:previous|above|prior)\s+instructions", re.I),
-    re.compile(r"you\s+are\s+now\s+(?:a|an|in)\s+", re.I),
-    re.compile(r"system\s*prompt\s*:", re.I),
-    re.compile(r"<\s*(?:script|iframe|object|embed)", re.I),
-    re.compile(r"javascript\s*:", re.I),
-    re.compile(r"data\s*:\s*text/html", re.I),
+    re.compile(r"ignore\s+(?:all\s+)?(?:previous|above|prior)\s+instructions", re.IGNORECASE),
+    re.compile(r"you\s+are\s+now\s+(?:a|an|in)\s+", re.IGNORECASE),
+    re.compile(r"system\s*prompt\s*:", re.IGNORECASE),
+    re.compile(r"<\s*(?:script|iframe|object|embed)", re.IGNORECASE),
+    re.compile(r"javascript\s*:", re.IGNORECASE),
+    re.compile(r"data\s*:\s*text/html", re.IGNORECASE),
 ]
 
 # HTML tag stripper
@@ -363,50 +482,204 @@ HIGH_RISK_PLACEHOLDERS = {
 
 
 def _read_service_token() -> str:
+    """Read a bounded token without following symlinks."""
     token = os.getenv("SERVICE_TOKEN", "")
     if token:
-        return token.strip()
-    if SERVICE_TOKEN_PATH:
+        return token if _valid_service_token(token) else ""
+    token_path = os.getenv("SERVICE_TOKEN_PATH", SERVICE_TOKEN_PATH).strip()
+    if token_path:
+        descriptor = -1
         try:
-            with open(SERVICE_TOKEN_PATH, encoding="utf-8") as f:
-                return f.read().strip()
-        except OSError:
+            descriptor = os.open(
+                token_path,
+                os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_NONBLOCK", 0),
+            )
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_nlink != 1
+                or metadata.st_mode & 0o077
+                or metadata.st_uid not in {0, os.geteuid()}
+                or not 32 <= metadata.st_size <= 4096
+            ):
+                return ""
+            raw = os.read(descriptor, 4097)
+            if len(raw) != metadata.st_size:
+                return ""
+            decoded = raw.decode("utf-8", errors="strict")
+            return decoded if _valid_service_token(decoded) else ""
+        except (OSError, UnicodeDecodeError):
             return ""
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
     return ""
 
 
-def _require_service_token():
+def _valid_service_token(token: str) -> bool:
+    """Require a bounded, control-free token with at least 256 bits of material."""
+    try:
+        encoded = token.encode("utf-8", errors="strict")
+    except UnicodeError:
+        return False
+    return (
+        32 <= len(encoded) <= 4096
+        and all(0x21 <= octet <= 0x7E for octet in encoded)
+    )
+
+
+def _insecure_loopback_dev_auth_allowed() -> bool:
+    if os.getenv("SECAI_ALLOW_INSECURE_NO_AUTH") != "1":
+        return False
+    try:
+        host, _port = BIND_ADDR.rsplit(":", 1)
+        host = host.strip("[]")
+        return host == "localhost" or ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _require_service_token() -> tuple[bool, Response | None]:
+    """Authenticate egress-capable endpoints and fail closed by default."""
     token = _read_service_token()
     if not token:
-        return None
+        if _insecure_loopback_dev_auth_allowed():
+            log.warning("explicit loopback-only insecure authentication mode is active")
+            return True, None
+        return False, (jsonify({"error": "service authentication unavailable"}), 503)
     auth = request.headers.get("Authorization", "")
     prefix = "Bearer "
     if not auth.startswith(prefix):
-        return jsonify({"error": "missing bearer token"}), 401
+        return False, (jsonify({"error": "forbidden"}), 403)
     if not hmac.compare_digest(auth[len(prefix):], token):
-        return jsonify({"error": "invalid bearer token"}), 403
-    return None
+        return False, (jsonify({"error": "forbidden"}), 403)
+    return True, None
+
+
+def _validate_policy(policy: object) -> dict:
+    """Validate the complete versioned policy and return a normalized copy."""
+    if not isinstance(policy, dict) or set(policy) != {"version", "search"}:
+        raise PolicyError("policy must contain only version and search")
+    if policy["version"] != 1 or isinstance(policy["version"], bool):
+        raise PolicyError("unsupported policy version")
+
+    search = policy["search"]
+    required_search_keys = {
+        "enabled",
+        "allowed_categories",
+        "differential_privacy",
+    }
+    if not isinstance(search, dict) or set(search) != required_search_keys:
+        raise PolicyError("search policy schema is invalid")
+    if not isinstance(search["enabled"], bool):
+        raise PolicyError("search.enabled must be a boolean")
+
+    categories = search["allowed_categories"]
+    if (
+        not isinstance(categories, list)
+        or not categories
+        or len(categories) > 32
+        or len(categories) != len(set(categories))
+        or any(
+            not isinstance(item, str)
+            or re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", item) is None
+            for item in categories
+        )
+    ):
+        raise PolicyError("search.allowed_categories is invalid")
+
+    dp = search["differential_privacy"]
+    required_dp_keys = {
+        "enabled",
+        "decoy_count",
+        "uniqueness_mode",
+        "batch_window",
+    }
+    if not isinstance(dp, dict) or set(dp) != required_dp_keys:
+        raise PolicyError("differential_privacy policy schema is invalid")
+    if not isinstance(dp["enabled"], bool):
+        raise PolicyError("differential_privacy.enabled must be a boolean")
+    decoy_count = dp["decoy_count"]
+    if isinstance(decoy_count, bool) or not isinstance(decoy_count, int):
+        raise PolicyError("differential_privacy.decoy_count must be an integer")
+    if not 0 <= decoy_count <= 10:
+        raise PolicyError("differential_privacy.decoy_count is out of range")
+    uniqueness_mode = dp["uniqueness_mode"]
+    if uniqueness_mode not in {"auto-block", "warn", "allow"}:
+        raise PolicyError("differential_privacy.uniqueness_mode is invalid")
+    batch_window = dp["batch_window"]
+    if (
+        isinstance(batch_window, bool)
+        or not isinstance(batch_window, (int, float))
+        or not math.isfinite(float(batch_window))
+        or not 0.0 <= float(batch_window) <= 30.0
+    ):
+        raise PolicyError("differential_privacy.batch_window is invalid")
+
+    return {
+        "version": 1,
+        "search": {
+            "enabled": search["enabled"],
+            "allowed_categories": list(categories),
+            "differential_privacy": {
+                "enabled": dp["enabled"],
+                "decoy_count": decoy_count,
+                "uniqueness_mode": uniqueness_mode,
+                "batch_window": float(batch_window),
+            },
+        },
+    }
 
 
 def load_policy() -> dict:
-    """Load the search policy from YAML. Returns empty dict if unavailable."""
+    """Atomically load and strictly validate one bounded policy snapshot."""
     if not POLICY_PATH:
-        return {}
+        if _insecure_loopback_dev_auth_allowed():
+            return _validate_policy(_DEVELOPMENT_POLICY)
+        raise PolicyError("POLICY_PATH is not configured")
+    descriptor = -1
     try:
-        with open(POLICY_PATH) as f:
-            return yaml.safe_load(f) or {}
-    except FileNotFoundError:
-        return {}
+        path = Path(POLICY_PATH)
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0),
+        )
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_mode & 0o022
+            or not 1 <= metadata.st_size <= MAX_POLICY_BYTES
+        ):
+            raise ValueError("policy is not a secure bounded regular file")
+        raw = os.read(descriptor, MAX_POLICY_BYTES + 1)
+        if len(raw) != metadata.st_size:
+            raise ValueError("policy changed while it was being read")
+        policy = yaml.safe_load(raw.decode("utf-8", errors="strict"))
+        return _validate_policy(policy)
+    except (OSError, UnicodeError, TypeError, ValueError, yaml.YAMLError) as exc:
+        log.error("policy unavailable or invalid")
+        raise PolicyError("policy unavailable or invalid") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
 
 
-def _is_search_enabled() -> bool:
+def _is_search_enabled(policy: dict | None = None) -> bool:
     """Check if web search is enabled in policy."""
-    policy = load_policy()
-    search_cfg = policy.get("search", {})
-    # If no policy file is configured, search is enabled by default
-    if not POLICY_PATH:
-        return True
-    return search_cfg.get("enabled", False)
+    validated = load_policy() if policy is None else policy
+    return validated["search"]["enabled"]
+
+
+def _allowed_categories(policy: dict | None = None) -> set[str]:
+    validated = load_policy() if policy is None else policy
+    return set(validated["search"]["allowed_categories"])
 
 
 # ---------------------------------------------------------------------------
@@ -419,14 +692,10 @@ def sanitize_query(raw_query: str) -> dict:
     Returns:
         {"query": sanitized_string, "redactions": [...], "blocked": bool, "reason": str}
     """
-    if not raw_query or not raw_query.strip():
+    if not isinstance(raw_query, str) or not raw_query.strip():
         return {"query": "", "redactions": [], "blocked": True, "reason": "empty query"}
 
     query = raw_query.strip()
-
-    # Enforce length limit
-    if len(query) > MAX_QUERY_LENGTH:
-        query = query[:MAX_QUERY_LENGTH]
 
     redactions = []
     for pattern, replacement in PII_PATTERNS:
@@ -455,6 +724,17 @@ def sanitize_query(raw_query: str) -> dict:
             "reason": "query contains too much PII",
         }
 
+    # Scan the entire request-bounded input before enforcing the outbound limit.
+    # Reject instead of truncating so PII at the boundary cannot be discarded
+    # before inspection or accidentally split into an unrecognized fragment.
+    if len(query) > MAX_QUERY_LENGTH:
+        return {
+            "query": "",
+            "redactions": redactions,
+            "blocked": True,
+            "reason": "query exceeds maximum length",
+        }
+
     return {"query": query, "redactions": redactions, "blocked": False, "reason": ""}
 
 
@@ -464,11 +744,18 @@ def sanitize_query(raw_query: str) -> dict:
 
 def sanitize_snippet(raw_text: str) -> str:
     """Clean a search result snippet: strip HTML, decode entities, remove injection."""
-    if not raw_text:
+    if not isinstance(raw_text, str) or not raw_text:
         return ""
 
     text = HTML_TAG_RE.sub(" ", raw_text)
     text = html.unescape(text)
+    text = unicodedata.normalize("NFKC", text)
+    # Remove controls, bidi overrides, zero-width format characters, and
+    # unpaired surrogates before pattern matching and JSON serialization.
+    text = "".join(
+        " " if unicodedata.category(character).startswith("C") else character
+        for character in text
+    )
     text = MULTI_SPACE_RE.sub(" ", text).strip()
     if len(text) > MAX_SNIPPET_LENGTH:
         text = text[:MAX_SNIPPET_LENGTH] + "..."
@@ -486,17 +773,39 @@ def check_injection(text: str) -> bool:
 
 def sanitize_results(raw_results: list) -> list:
     """Sanitize a list of search results from SearXNG."""
+    if not isinstance(raw_results, list):
+        return []
     clean = []
     for r in raw_results[:MAX_RESULTS]:
+        if not isinstance(r, dict):
+            continue
         title = sanitize_snippet(r.get("title", ""))
         snippet = sanitize_snippet(r.get("content", ""))
         url = r.get("url", "")
 
         try:
+            if not isinstance(url, str) or len(url.encode("utf-8")) > MAX_RESULT_URL_LENGTH:
+                raise ValueError("invalid URL")
+            decoded_url = unquote(url)
+            if (
+                "\\" in decoded_url
+                or any(character.isspace() for character in url)
+                or any(
+                    unicodedata.category(character).startswith("C")
+                    for character in decoded_url
+                )
+            ):
+                raise ValueError("invalid URL")
             parsed = urlparse(url)
-            if parsed.scheme not in ("http", "https"):
-                url = ""
-        except Exception:
+            if (
+                parsed.scheme not in ("http", "https")
+                or not parsed.hostname
+                or parsed.username is not None
+                or parsed.password is not None
+            ):
+                raise ValueError("invalid URL")
+            _ = parsed.port
+        except (TypeError, UnicodeError, ValueError):
             url = ""
 
         if check_injection(title) or check_injection(snippet):
@@ -508,7 +817,7 @@ def sanitize_results(raw_results: list) -> list:
                 "title": title,
                 "snippet": snippet,
                 "url": url,
-                "source": parsed.netloc if url else "unknown",
+                "source": parsed.hostname if url else "unknown",
             })
 
     return clean
@@ -541,9 +850,7 @@ def build_context(results: list) -> str:
 
 def audit_search(query: str, redactions: list, num_results: int, blocked: bool):
     """Write a hash-chained audit record for every search attempt."""
-    query_hash = hashlib.sha256(query.encode()).hexdigest()[:16]
     _audit_chain.append("web_search", {
-        "query_hash": query_hash,
         "query_length": len(query),
         "redactions_count": len(redactions),
         "results_returned": num_results,
@@ -555,16 +862,40 @@ def audit_search(query: str, redactions: list, num_results: int, blocked: bool):
 # Routes
 # ---------------------------------------------------------------------------
 
+@app.errorhandler(RequestEntityTooLarge)
+def request_too_large(_error):
+    """Return a stable JSON response for declared and streamed oversized bodies."""
+    return jsonify({"error": "request body too large"}), 413
+
 @app.route("/health")
 def health():
-    enabled = _is_search_enabled()
+    authenticated, auth_error = _require_service_token()
+    if not authenticated:
+        return auth_error
+
+    try:
+        policy = load_policy()
+    except PolicyError:
+        return jsonify({
+            "status": "degraded",
+            "search_enabled": False,
+            "searxng_reachable": False,
+            "error": "service policy unavailable",
+        }), 503
+
+    enabled = _is_search_enabled(policy)
 
     searxng_ok = False
-    try:
-        resp = requests.get(f"{SEARXNG_URL}/healthz", timeout=3)
-        searxng_ok = resp.status_code == 200
-    except Exception:
-        pass
+    if enabled:
+        try:
+            status_code = _upstream_get(
+                "/healthz",
+                timeout=3,
+                expect_json=False,
+            )
+            searxng_ok = status_code == 200
+        except (requests.RequestException, OSError, ValueError):
+            log.warning("SearXNG readiness probe failed")
 
     return jsonify({
         "status": "ok",
@@ -573,26 +904,41 @@ def health():
     })
 
 
+@app.route("/live")
+def live():
+    """Process liveness must not depend on the optional upstream service."""
+    return jsonify({"status": "ok"})
+
+
 @app.route("/v1/search", methods=["POST"])
 def search():
     """Perform a sanitized web search."""
 
-    auth_error = _require_service_token()
-    if auth_error:
+    authenticated, auth_error = _require_service_token()
+    if not authenticated:
         return auth_error
 
     if request.content_length and request.content_length > MAX_SEARCH_BODY_BYTES:
         return jsonify({"error": "request body too large"}), 413
 
-    if not _is_search_enabled():
+    try:
+        policy = load_policy()
+    except PolicyError:
+        return jsonify({"error": "service policy unavailable"}), 503
+
+    if not _is_search_enabled(policy):
         return jsonify({"error": "web search is disabled in policy"}), 403
 
     body = request.get_json(silent=True)
-    if not body:
-        return jsonify({"error": "JSON body required"}), 400
+    if not isinstance(body, dict):
+        return jsonify({"error": "JSON object body required"}), 400
 
     raw_query = body.get("query", "")
     categories = body.get("categories", "general")
+    if not isinstance(raw_query, str):
+        return jsonify({"error": "query must be a string"}), 400
+    if not isinstance(categories, str) or categories not in _allowed_categories(policy):
+        return jsonify({"error": "search category is not allowed"}), 400
 
     # Sanitize the outbound query
     san = sanitize_query(raw_query)
@@ -604,7 +950,7 @@ def search():
         }), 422
 
     # Differential privacy checks
-    dp_config = _load_dp_config()
+    dp_config = _load_dp_config(policy)
     uniqueness_warning = None
     decoys_sent = 0
 
@@ -616,14 +962,16 @@ def search():
                 audit_search(raw_query, san["redactions"], 0, True)
                 return jsonify({
                     "error": "query blocked: contains highly unique/identifying terms",
-                    "unique_matches": uq["matches"],
+                    "unique_match_count": len(uq["matches"]),
                 }), 422
             elif mode == "warn":
                 uniqueness_warning = (
-                    f"This query contains potentially identifying terms: "
-                    f"{', '.join(uq['matches'][:3])}"
+                    "This query contains potentially identifying terms"
                 )
-                log.warning("unique query detected (warn mode): %s", uq["matches"][:3])
+                log.warning(
+                    "unique query detected (warn mode; matches=%d)",
+                    len(uq["matches"]),
+                )
 
         category = generalize_query(san["query"])
         if category:
@@ -641,8 +989,8 @@ def search():
 
     # Query SearXNG
     try:
-        resp = requests.get(
-            f"{SEARXNG_URL}/search",
+        data = _upstream_get(
+            "/search",
             params={
                 "q": padded_query,
                 "format": "json",
@@ -651,16 +999,22 @@ def search():
                 "safesearch": "1",
             },
             timeout=30,
+            expect_json=True,
         )
-        resp.raise_for_status()
-        data = resp.json()
     except requests.Timeout:
         audit_search(raw_query, san["redactions"], 0, False)
         return jsonify({"error": "search timed out"}), 504
-    except Exception as e:
+    except (
+        requests.RequestException,
+        OSError,
+        UnicodeError,
+        TypeError,
+        ValueError,
+        json.JSONDecodeError,
+    ):
         log.exception("SearXNG request failed")
         audit_search(raw_query, san["redactions"], 0, False)
-        return jsonify({"error": f"search failed: {str(e)}"}), 502
+        return jsonify({"error": "search upstream unavailable"}), 502
 
     raw_results = data.get("results", [])
     clean_results = sanitize_results(raw_results)
@@ -687,27 +1041,34 @@ def search():
 @app.route("/v1/search/test", methods=["GET"])
 def search_test():
     """Quick connectivity test: verify SearXNG is reachable."""
-    auth_error = _require_service_token()
-    if auth_error:
+    authenticated, auth_error = _require_service_token()
+    if not authenticated:
         return auth_error
 
-    if not _is_search_enabled():
+    try:
+        policy = load_policy()
+    except PolicyError:
+        return jsonify({"error": "service policy unavailable"}), 503
+
+    if not _is_search_enabled(policy):
         return jsonify({"error": "web search is disabled"}), 403
 
     try:
-        resp = requests.get(
-            f"{SEARXNG_URL}/search",
+        status_code = _upstream_get(
+            "/search",
             params={"q": "test", "format": "json"},
             timeout=30,
+            expect_json=False,
         )
         return jsonify({
             "status": "ok",
-            "searxng_status": resp.status_code,
+            "searxng_status": status_code,
         })
-    except Exception as e:
+    except (requests.RequestException, OSError, ValueError):
+        log.warning("SearXNG connectivity test failed")
         return jsonify({
             "status": "error",
-            "error": str(e),
+            "error": "search upstream unavailable",
         }), 502
 
 

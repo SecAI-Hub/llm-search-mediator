@@ -3,256 +3,221 @@
 [![CI](https://github.com/SecAI-Hub/llm-search-mediator/actions/workflows/ci.yml/badge.svg)](https://github.com/SecAI-Hub/llm-search-mediator/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
-**Privacy-preserving search bridge for local LLMs.**
+A least-privilege search bridge between an LLM client and a SearXNG instance.
+It removes common PII patterns from outbound queries, adds configurable cover
+traffic, bounds upstream responses, filters obvious prompt-injection patterns,
+and records privacy-minimized audit events.
 
-llm-search-mediator sits between your AI agent and the web. It sanitizes outbound queries (strips PII), pads queries to fixed sizes, sends decoy/cover searches, applies statistical query privacy protections, filters inbound results for prompt injection, and audit-logs every decision with a tamper-evident hash chain.
+The filters are defense in depth. They do not make arbitrary web content safe,
+provide formal differential privacy, or prevent a compromised SearXNG instance
+from observing sanitized queries. Downstream models must continue to treat every
+returned title, snippet, and URL as untrusted data.
 
-## Why
+## Security properties
 
-When LLMs search the web, two things go wrong:
+- Egress-capable and readiness endpoints require a bearer service token and
+  fail closed when it is missing or unreadable.
+- An unauthenticated mode exists only behind the explicit
+  `SECAI_ALLOW_INSECURE_NO_AUTH=1` switch and only on a loopback bind.
+- Policy is required for search outside that development mode. Each request
+  uses one no-follow, bounded snapshot validated against the strict version 1
+  schema; missing, malformed, unknown, or out-of-range fields return `503`.
+- SearXNG must be configured as a credential-free HTTP(S) origin. Redirects,
+  ambient proxy environment variables, caller headers, and responses over
+  2 MiB are rejected.
+- Request bodies, queries, snippets, result counts, context, URLs, decoys, and
+  batch delays are bounded. The full request-bounded query is inspected for PII
+  before an overlength query is rejected.
+- Audit events omit query text and query hashes. With an HMAC key, an
+  authenticated checkpoint detects modification plus tail, archive, or complete
+  log deletion.
+- Gunicorn deliberately uses one worker because the audit tail and batch state
+  are process-local; bounded threads provide concurrency.
 
-1. **Privacy leakage** -- the query itself may contain PII, sensitive terms, or identifying patterns that leak through the search provider.
-2. **Prompt injection** -- search results can contain adversarial text ("ignore previous instructions...") that hijacks the LLM.
-
-llm-search-mediator solves both problems by acting as a sanitizing proxy in front of any SearXNG (or compatible metasearch) backend.
-
-### Use cases
-
-- Local AI assistants with web search (Claude, GPT, open-source LLMs)
-- RAG pipelines that augment answers with web results
-- Privacy-focused AI applications
-- Any system where an LLM needs web access without leaking user data
-
-## Features
-
-| Feature | Description |
-|---|---|
-| PII stripping | Detects and redacts email, phone, SSN, credit cards, IPs, API keys, hex tokens |
-| High-PII blocking | Blocks queries that are >50% redacted PII |
-| Prompt injection filtering | Detects 6 injection patterns in inbound results and drops them |
-| HTML sanitization | Strips tags, decodes entities, enforces snippet length limits |
-| Query privacy protections | Decoy queries, query generalization, k-anonymity checking |
-| Traffic analysis protection | Random timing jitter, fixed-size query padding (256/512/1024 byte buckets) |
-| Batch timing | Groups queries into fixed time windows to prevent timing correlation |
-| Query uniqueness detection | Flags queries with proper names, addresses, case numbers |
-| Hash-chained audit log | Tamper-evident JSONL audit trail with SHA-256 chain |
-| Hot-reloadable policy | YAML-based policy with query privacy settings |
-| URL validation | Rejects non-HTTP(S) URLs in results |
+See [the security audit](SECURITY_AUDIT.md) and
+[threat model](THREAT_MODEL.md) for residual risks and production controls.
 
 ## Quick start
 
-### 1. Install
+Use Python 3.12 or newer and the hash-locked dependencies:
 
 ```bash
-pip install -r requirements.txt
+python3.12 -m venv .venv
+.venv/bin/python -m pip install --require-hashes -r requirements.lock
 ```
 
-### 2. Start SearXNG
-
-llm-search-mediator requires a running SearXNG instance. See [SearXNG docs](https://docs.searxng.org/) for setup, or use Docker:
+Create owner-only credentials and use the provided standalone policy:
 
 ```bash
-docker run -d -p 8888:8080 searxng/searxng
+umask 077
+openssl rand -hex 32 | tr -d '\n' > service-token
+openssl rand -hex 32 | tr -d '\n' > audit-hmac-key
+
+SERVICE_TOKEN_PATH="$PWD/service-token" \
+AUDIT_HMAC_KEY_PATH="$PWD/audit-hmac-key" \
+POLICY_PATH="$PWD/examples/standalone-profile.yaml" \
+AUDIT_DIR="$PWD/.local-audit" \
+SEARXNG_URL="http://127.0.0.1:8888" \
+BIND_ADDR="127.0.0.1:8485" \
+.venv/bin/gunicorn \
+  --config python:search_mediator.gunicorn_conf \
+  search_mediator.app:app
 ```
 
-### 3. Run
+The files must be owned by the service user or root, regular, single-link,
+have no group/other permission bits (normally mode `0600` or `0400`), contain
+32–4096 printable ASCII bytes, and contain no whitespace or control bytes. Use
+systemd credentials or a secrets manager in production rather than
+repository-local files.
+
+Send an authenticated request:
 
 ```bash
-# Minimal (no policy file, search enabled by default)
-python -m search_mediator.app
-
-# With policy file
-POLICY_PATH=./examples/policy.yaml python -m search_mediator.app
-
-# With custom SearXNG URL
-SEARXNG_URL=http://localhost:8888 python -m search_mediator.app
+curl --fail-with-body \
+  --request POST http://127.0.0.1:8485/v1/search \
+  --header "Authorization: Bearer $(tr -d '\r\n' < service-token)" \
+  --header "Content-Type: application/json" \
+  --data '{"query":"what is retrieval augmented generation","categories":"general"}'
 ```
 
-### 4. Search
+For local experiments only, search can run without credential and policy files:
 
 ```bash
-curl -s -X POST http://127.0.0.1:8485/v1/search \
-  -H "Content-Type: application/json" \
-  -d '{"query":"what is retrieval augmented generation"}' | jq .
+SECAI_ALLOW_INSECURE_NO_AUTH=1 \
+BIND_ADDR=127.0.0.1:8485 \
+AUDIT_DIR="$PWD/.local-audit" \
+.venv/bin/python -m search_mediator.app
 ```
 
-```json
-{
-  "results": [
-    {
-      "title": "Retrieval-Augmented Generation (RAG)",
-      "snippet": "RAG is a technique that combines...",
-      "url": "https://example.com/rag",
-      "source": "example.com"
-    }
-  ],
-  "context": "The following information was retrieved from web search:\n[1] ...",
-  "query_used": "what is retrieval augmented generation",
-  "redactions": 0,
-  "decoys_sent": 2
-}
-```
-
-PII is automatically stripped:
-
-```bash
-curl -s -X POST http://127.0.0.1:8485/v1/search \
-  -H "Content-Type: application/json" \
-  -d '{"query":"contact john@example.com about the project"}' | jq .query_used
-```
-
-```
-"contact [EMAIL] about the project"
-```
+The application rejects that override on wildcard, LAN, or public bind
+addresses.
 
 ## API
 
-| Endpoint | Method | Description |
+| Endpoint | Authentication | Purpose |
 |---|---|---|
-| `/health` | GET | Health check + SearXNG reachability |
-| `/v1/search` | POST | Sanitized web search |
-| `/v1/search/test` | GET | SearXNG connectivity test |
+| `GET /live` | No | Process liveness only; does not probe SearXNG or reveal policy. |
+| `GET /health` | Bearer token | Readiness, policy enablement, and SearXNG reachability. |
+| `GET /v1/search/test` | Bearer token | Explicit SearXNG connectivity test. |
+| `POST /v1/search` | Bearer token | Sanitized, bounded search request. |
 
-### POST /v1/search
+A successful search returns sanitized result objects, a bounded context string,
+the sanitized query, redaction count, decoy count, and an optional generic
+uniqueness warning. Expected error statuses include `400` invalid input, `403`
+bad authorization or disabled search, `413` oversized body, `422` policy block,
+`502` unavailable/invalid upstream, `503` unavailable authentication or policy,
+and `504` timeout.
 
-**Request:**
-```json
-{
-  "query": "how does RAG work",
-  "categories": "general"
-}
-```
-
-**Response (200):**
-```json
-{
-  "results": [...],
-  "context": "pre-formatted text for LLM injection",
-  "query_used": "sanitized query",
-  "redactions": 0,
-  "decoys_sent": 2,
-  "uniqueness_warning": null
-}
-```
-
-**Response (422) -- query blocked:**
-```json
-{
-  "error": "query blocked: query contains too much PII",
-  "redactions": 5
-}
-```
+The OpenAPI description is in [`schemas/openapi.yaml`](schemas/openapi.yaml).
 
 ## Configuration
 
-All configuration is via environment variables:
-
 | Variable | Default | Description |
 |---|---|---|
-| `BIND_ADDR` | `127.0.0.1:8485` | Listen address |
-| `SEARXNG_URL` | `http://127.0.0.1:8888` | SearXNG instance URL |
-| `POLICY_PATH` | (none) | Path to YAML policy file (optional) |
-| `AUDIT_DIR` | `/var/lib/llm-search-mediator/logs` | Audit log directory |
-| `QUERY_DELAY_MIN` | `0.5` | Minimum random delay (seconds) |
-| `QUERY_DELAY_MAX` | `3.0` | Maximum random delay (seconds) |
+| `BIND_ADDR` | `127.0.0.1:8485` | Gunicorn/app listen address. Keep loopback unless a protected service network is intentional. |
+| `SEARXNG_URL` | `http://127.0.0.1:8888` | Credential-free SearXNG origin; no path, query, or fragment. Use HTTPS for a remote host. |
+| `POLICY_PATH` | unset | Secure YAML policy path. Required to enable search outside explicit loopback development. |
+| `AUDIT_DIR` | `/var/lib/llm-search-mediator/logs` | Writable private audit directory. |
+| `SERVICE_TOKEN_PATH` | unset | Preferred service-token file. |
+| `SERVICE_TOKEN` | unset | Compatibility-only inline token; process environments are easier to expose. |
+| `AUDIT_HMAC_KEY_PATH` | unset | Strongly recommended key file for authenticated entries and checkpoints. |
+| `QUERY_DELAY_MIN` | `0.5` | Minimum random delay, clamped to finite `0..30` seconds. |
+| `QUERY_DELAY_MAX` | `3.0` | Maximum random delay, clamped to finite `0..30` seconds. |
+| `GUNICORN_THREADS` | `4` | Thread count, clamped to `1..16`. |
+| `GUNICORN_TIMEOUT` | `60` | Worker timeout, clamped to `10..300` seconds. |
 
-## Policy reference
+### Policy
 
-See [examples/policy.yaml](examples/policy.yaml) for a fully annotated example.
+Policy is re-read once per request so an atomic file replacement can take
+effect without restart and all decisions within that request use the same
+snapshot. Supported fields are intentionally small:
 
-### Privacy pipeline
-
-Every search query goes through this pipeline:
-
-1. **PII stripping** -- 8 pattern types detected and redacted
-2. **High-PII check** -- block if >50% of tokens are redacted
-3. **Uniqueness check** -- flag queries with identifying patterns
-4. **Query generalization** -- send a cover search for the broad category first
-5. **Decoy searches** -- send N random plausible queries before the real one
-6. **Batch timing** -- wait until the batch window has elapsed
-7. **Random delay** -- add jitter to decorrelate timing
-8. **Query padding** -- pad to fixed-size bucket (256/512/1024 bytes)
-9. **SearXNG query** -- send via SearXNG (optionally through Tor)
-10. **Result sanitization** -- strip HTML, check injection, validate URLs
-11. **Context building** -- format results as LLM-ready context string
-12. **Audit logging** -- hash-chained JSONL entry
-
-## Hardening
-
-For production deployment, see [deploy/](deploy/) for:
-- **Systemd unit** with `DynamicUser=yes`, `PrivateNetwork=no` (needs SearXNG), `MemoryDenyWriteExecute=yes`
-- **Seccomp profile** blocking dangerous syscalls
-
-For maximum privacy, route SearXNG through Tor. See [examples/policy.yaml](examples/policy.yaml) for Tor routing setup notes.
-
-## Privacy note
-
-> **These are practical privacy protections (decoys, generalization, k-anonymity checks) -- not formal differential privacy with epsilon/delta guarantees.** The term "differential privacy" in code-level config keys (e.g., `differential_privacy` in policy YAML) is retained for backward compatibility, but the protections provided are best described as _statistical query privacy_: they make it harder for an observer to link a specific query to a specific user, but they do not satisfy the mathematical definition of differential privacy.
-
-## Privacy: data retention
-
-The hash-chained audit log records metadata about every search attempt. Here is what it stores and what it does **not** store:
-
-### What IS stored
-
-| Field | Description |
-|---|---|
-| `query_hash` | Truncated SHA-256 of the **original** query (first 16 hex chars). Not reversible. |
-| `sanitized_query` | The query **after** PII stripping (all PII replaced with placeholders like `[EMAIL]`). |
-| `redactions_count` | Number of PII patterns that were redacted. |
-| `results_returned` | Count of results returned (integer only). |
-| `blocked` | Whether the query was blocked. |
-| `timestamp` | ISO 8601 UTC timestamp. |
-| `prev_hash` / `entry_hash` | SHA-256 chain hashes for tamper evidence. |
-
-### What is NOT stored
-
-- **Raw user queries** -- only the PII-stripped version is logged.
-- **Search result content** -- only the result count is recorded, never titles, snippets, or URLs.
-- **PII values** -- stripped before logging; only placeholder tokens appear.
-- **IP addresses or user identifiers** -- no client metadata is recorded.
-
-### Retention defaults
-
-- **Deletion policy:** none. The log is append-only for tamper evidence. Operators may implement external rotation or deletion policies as needed.
-- **Log rotation:** the audit file rotates automatically at **50 MB** (configurable via `max_size_mb` in `AuditChain`). Rotated files are made read-only (mode `0444`).
-- **Rotated file naming:** `search-audit.<YYYYMMDD-HHMMSS>.jsonl`.
-
-### Verifying chain integrity
-
-```python
-from search_mediator.audit_chain import AuditChain
-
-result = AuditChain.verify("/var/lib/llm-search-mediator/logs/search-audit.jsonl")
-print(result)
-# {"valid": True, "entries": 42, "broken_at": None, "detail": "chain intact: 42 entries verified"}
+```yaml
+version: 1
+search:
+  enabled: true
+  allowed_categories:
+    - general
+  differential_privacy:
+    enabled: true
+    decoy_count: 2
+    uniqueness_mode: warn
+    batch_window: 5.0
 ```
 
-If any entry has been modified, deleted, or inserted, the `valid` field will be `False` and `broken_at` will indicate the line number of the first break.
+`decoy_count` must be an integer in `0..10`, `batch_window` a finite number in
+`0..30`, and `uniqueness_mode` one of `auto-block`, `warn`, or `allow`.
+All shown keys are required and unknown keys or invalid values make policy
+unavailable (`503`); they never fall back to permissive defaults. Configure
+actual engines, plugins, safesearch behavior, and Tor routing in SearXNG; the
+mediator does not enforce an engine allowlist.
 
-## Configuration profiles
+The historical policy key name `differential_privacy` is retained for
+compatibility. Decoys, generalization, uniqueness heuristics, padding, timing
+jitter, and batch delay are statistical privacy measures with no epsilon/delta
+guarantee. Cover traffic also increases upstream disclosure and latency.
 
-Pre-built configuration profiles are provided in `examples/`:
+## Audit data
 
-| Profile | File | Description |
-|---|---|---|
-| **Appliance (strict offline)** | [`examples/appliance-profile.yaml`](examples/appliance-profile.yaml) | Search disabled, all privacy protections maxed, no external network. For air-gapped or appliance deployments. |
-| **Standalone** | [`examples/standalone-profile.yaml`](examples/standalone-profile.yaml) | Standard config with recommended defaults for general use with SearXNG. |
-| **Policy reference** | [`examples/policy.yaml`](examples/policy.yaml) | Fully annotated policy reference with all options explained. |
+Each search attempt records only:
 
-Usage:
+- original query length;
+- count of detected redactions;
+- number of sanitized results returned;
+- whether the request was blocked; and
+- timestamp, event type, previous hash, entry hash, and algorithm.
+
+Raw or sanitized query text, matched PII values, client identifiers, titles,
+snippets, result URLs, and reversible low-entropy query hashes are not recorded.
+
+The current file rotates at 50 MiB by default. Archives become mode `0400`.
+When `AUDIT_HMAC_KEY_PATH` is configured, startup refuses a missing/insecure key
+or an unverifiable existing chain, and an authenticated checkpoint detects tail
+or full-log deletion while the checkpoint survives. Because the checkpoint is
+co-located by default, deleting both the logs and checkpoint cannot be proven
+locally. The implementation supports one process writer. Forward checkpoints
+and archives to separately administered append-only storage for stronger
+guarantees and define an external retention policy.
+
+## Production deployment
+
+The [`deploy/systemd/llm-search-mediator.service`](deploy/systemd/llm-search-mediator.service)
+unit uses a dynamic user, systemd credentials, restrictive filesystem and
+kernel settings, an empty capability set, and resource limits. Review its
+network and syscall requirements on the target Fedora release before rollout.
+
+The container uses a digest-pinned non-root Python base, applies available OS
+security updates during the build, and installs hash-locked dependencies. CI
+and release gates reject fixable high/critical image vulnerabilities. It binds
+`0.0.0.0` inside the container but remains fail
+closed until policy and token mounts are supplied. Publish ports only on an
+authenticated private service network or bind the host mapping to
+`127.0.0.1`. Use a read-only root filesystem, tmpfs for `/tmp`, a read-only
+policy/credential mount, a writable private audit volume, dropped capabilities,
+and CPU/memory/PID limits.
+
+## Development
 
 ```bash
-# Appliance mode (search disabled, privacy maxed)
-POLICY_PATH=./examples/appliance-profile.yaml python -m search_mediator.app
-
-# Standalone mode (recommended defaults)
-POLICY_PATH=./examples/standalone-profile.yaml python -m search_mediator.app
+python3.12 -m venv .venv
+.venv/bin/python -m pip install --require-hashes -r requirements-dev.lock
+.venv/bin/ruff check search_mediator tests
+.venv/bin/bandit -q -r search_mediator
+.venv/bin/python -m pip_audit
+.venv/bin/python -m pytest -q
 ```
 
-## Integration with SecAI OS
+Regenerate locks deliberately after reviewing dependency changes; CI installs
+with `--require-hashes`, builds the container, and scans the final image before
+release.
 
-llm-search-mediator is a core component of [SecAI OS](https://github.com/SecAI-Hub/SecAI_OS), where it runs with Tor routing, strict systemd sandboxing, and seccomp filtering.
+## SecAI_OS integration
+
+In [SecAI_OS](https://github.com/SecAI-Hub/SecAI_OS), keep the inference runtime
+without general network access and permit only authenticated calls to this
+mediator. Give the mediator access only to the expected SearXNG origin, keep
+SearXNG/Tor in a separate service boundary, and treat returned context as an
+untrusted citation source rather than instructions.
 
 ## License
 
