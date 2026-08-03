@@ -114,7 +114,7 @@ class TestQuerySanitization:
             "123 Main Street",
             "192.168.1.100",
             "dob 01/02/1990",
-            "api_key: abcdefghijklmnopqrstuvwxyz123456",
+            "api_key: " + ("x" * 32),
             "abcdef0123456789abcdef0123456789",
         ],
     )
